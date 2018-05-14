@@ -1,0 +1,15 @@
+menu "Custom Settings"
+
+config ESP_SSID_toConnect
+     string "WIFI SSID"
+     default "LoDi"
+     help
+     SSID (network name) for the LAN you want to connect to.
+
+config ESP_WIFI_PASSWORD
+    string "WiFi Password"
+    default "apollo#137"
+    help
+    WiFi password (WPA or WPA2) for the LAB you want to connect to.
+
+endmenu
