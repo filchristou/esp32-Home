@@ -13,6 +13,7 @@
 using namespace std;
 #include <iostream>
 #include <string>
+#include <exception>
 
 extern "C" {
      void app_main();
@@ -65,34 +66,258 @@ static bool LED_STATE;
 
 #define BACKLOG 4 //how many pending connections queue will hold
 #define PORT_ACCEPT "8765" //the port users will be connecting to
+#define EZPANDA_IP "83.212.106.103"
 
 static EventGroupHandle_t wifi_event_group; //to handle and sychronize wifi events
 const int CONNECTED_BIT = BIT0; //when this bit is set, esp32 is connected to a wifi LAN network
 
-/*
-//handling TCP packets for now
-class Server
+//the Exception
+class SocketException: public exception
 {
      private:
-          struct addrinfo *server_info;
-          int socket_listen = NULL;
+          string msg;
+          int ret;
+          u32_t optlen;
+     public:
+          virtual const char* what() const throw()
+          {
+               return "###|Socket exception happened";
+          } //0 error code means NO socket oriented error was made
 
-          Server();
-          ~Server();
-          void createSocket(); //creates, binds, listens to a socket
-          string void wait4Request();
-          void writeResponse();
-          void closeClientSocket();
+          SocketException(int socket, string msgFromCode)
+          {
+               this->msg = msgFromCode;
+               ret = 0;
+               if (socket != 0)
+               {
+                    optlen = sizeof(ret);
+                    getsockopt(socket, SOL_SOCKET, SO_ERROR, &ret, &optlen);
+               }
+
+               //convert ret-int to char*
+               char retChars[3];
+               sprintf(retChars, "%d", ret);
+
+               //std::string stream ss <<"###|Error code " <<ret + <<": " <<msgFromCode;
+               this->msg = "###|Error code " + std::string(retChars) + ": " + msgFromCode;
+          }
+
+          string getMsg()
+          {
+               return this->msg;
+          }
 };
 
-class Client
+//-----------------------------CLASS DECLARATTION START-----------------------------------//
+class Connection
 {
-     protected: host = null;
+     protected:
+          int socket_listen, socket_comm;
+          //get sockaddr, IPv4 or IPv6
+          //accepts sockaddr_storage as input only
+          void *get_in_addr(struct sockaddr *sa)
+          {
+               if (sa->sa_family == AF_INET) //if it's IPv4
+                    return &(((struct sockaddr_in*)sa)->sin_addr);
+               else //it's IPv6
+                    return &(((struct sockaddr_in6*)sa)->sin6_addr);
+          }
+     public:
+          void closeClientSocket() { close(socket_comm); }
+          void sendData(string response) //send
+          {
+               if (send(socket_comm, response.c_str(), response.length()+1, 0) == -1)
+               {
+                    SocketException e(socket_comm, "send() error");
+                    throw e;
+               }
+          }
+          string recvData() //recv
+          {
+               char buf[MAXDATASIZE];
+               int numbytes;
+               if ((numbytes = recv(socket_comm, buf, MAXDATASIZE-1, 0)) == -1) //returns the number of bytes read
+               {
+                    close(socket_comm);
+                    SocketException e(socket_comm, "recv() error");
+                    throw e;
+               }
+               buf[numbytes] = '\0';
 
-     protected: void createSocket(); //creates socket and binds to the server
+               return std::string(buf);
+          }
 };
-*/
 
+class Server: public Connection
+{
+     private:
+          struct addrinfo hints, *server_info;
+          const char *port_service;
+          char IPaddress[INET6_ADDRSTRLEN];
+
+     public:
+          Server(string service);
+          ~Server() { close(socket_listen); }
+          void createSocket(); //creates, binds, listens to a socket
+          string wait4ClientRequest(); //accepts, recv
+};
+
+// @arg 1 is port essentially
+Server::Server(string service)
+{
+     socket_listen = 0;
+     socket_comm = 0;
+     port_service = service.c_str();
+
+     memset(&hints, 0, sizeof(hints));
+     hints.ai_family = AF_UNSPEC; //use either IPv4 or IPv6
+     hints.ai_socktype = SOCK_STREAM; //TCP packets
+     hints.ai_flags = AI_PASSIVE; //use my IP, since I am a server
+}
+
+void Server::createSocket()
+{
+     if (getaddrinfo(NULL, port_service, &hints, &server_info) != 0) //if fail
+     {
+          SocketException e(0, "getaddrinfo() error");
+          throw e;
+     }
+
+     struct addrinfo *p;
+     int count = 0;
+     for (p=server_info ; p != NULL ; p=p->ai_next)
+     {
+          if ( (socket_listen = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)
+          {
+               count++;
+               continue;
+          }
+          if (bind(socket_listen, p->ai_addr, p->ai_addrlen))
+          {
+               count++;
+               close(socket_listen);
+               continue;
+          }
+
+
+          //---------------------------------- print bind settings ----------------------------------//
+          void* addr;
+          string ipver;
+          //* get the pointer to the address itself,
+          //* different fields in IPv4 and IPv6:
+          if (p->ai_family == AF_INET) // IPv4
+          {
+               struct sockaddr_in *ipv4 = (struct sockaddr_in *)p->ai_addr;
+               addr = &(ipv4->sin_addr);
+               ipver = "IPv4";
+          } else // IPv6
+          {
+               struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)p->ai_addr;
+               addr = &(ipv6->sin6_addr);
+               ipver = "IPv6";
+          }
+
+          //* convert the IP to a string and print it:
+          inet_ntop(p->ai_family, addr, IPaddress, sizeof(IPaddress));
+          cout <<"###|Server binded to --> " <<ipver <<": " <<IPaddress  <<"port " <<port_service <<endl;
+          //-----------------------------------------------------------------------------------------//
+          break;
+     }
+     if (p == NULL)
+     {
+          SocketException e(socket_listen, "socket_listen is NULL");
+          throw e;
+     }
+     freeaddrinfo(server_info); //all done with this structure.
+     if (listen(socket_listen, BACKLOG) == -1)
+     {
+          SocketException e(socket_listen, "listen() error");
+          throw e;
+     }
+}
+
+string Server::wait4ClientRequest()
+{
+     socklen_t sock_in_size;
+     struct sockaddr_storage their_addr; //connector's address information. IPv4 or IPv6
+     sock_in_size = sizeof(their_addr);
+
+     if ((socket_comm = accept(socket_listen, (struct sockaddr *)&their_addr, &sock_in_size)) == -1)
+     {
+          close(socket_comm);
+          SocketException e(socket_comm, "accept_error() error");
+          throw e;
+     }
+
+     inet_ntop(their_addr.ss_family, //convert IP customer addreess to printable
+          get_in_addr((struct sockaddr*)&their_addr ), IPaddress, sizeof(IPaddress));
+     printf("###|SERVER : got connection from %s\n", IPaddress);
+
+     //read request
+     return recvData();
+}
+
+class Client: public Connection
+{
+     private:
+          struct addrinfo hints, *server_info;
+          const char *port_service;
+          char IPaddress[INET6_ADDRSTRLEN];
+     public:
+          Client();
+          void createSocket(string serverName, string service);
+};
+
+Client::Client()
+{
+     socket_comm = 0;
+
+     memset(&hints, 0, sizeof hints);
+     hints.ai_family = AF_UNSPEC;
+     hints.ai_socktype = SOCK_STREAM;
+}
+
+void Client::createSocket(string serverName, string service)
+{
+     port_service = service.c_str();
+
+     if (getaddrinfo(serverName.c_str(), port_service, &hints, &server_info) != 0) //if fail
+     {
+          SocketException e(0, "getaddrinfo() client error");
+          throw e;
+     }
+
+     struct addrinfo *p;
+     int count = 0;
+     for (p=server_info ; p != NULL ; p=p->ai_next)
+     {
+          if ( (socket_comm = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)
+          {
+               count++;
+               continue;
+          }
+
+          if (connect(socket_comm, p->ai_addr, p->ai_addrlen) == -1) {
+               count++;
+               close(socket_comm);
+               continue;
+          }
+          break;
+     }
+
+     if (p == NULL)
+     {
+          SocketException e(socket_comm, "client failed to connect");
+          throw e;
+     }
+     inet_ntop(p->ai_family, get_in_addr((struct sockaddr *)p->ai_addr),
+          IPaddress, sizeof(IPaddress));
+     printf("client: connecting to %s\n", IPaddress);
+
+     freeaddrinfo(server_info); // all done with this structure
+}
+
+//---------------------CLASS DECLARATTION OVER---------------------------//
 
 void IRAM_ATTR timerHandler(void *para)
 {
@@ -173,7 +398,7 @@ esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
                          default:
                               authmode = "Unknown";
                     }
-                    cout <<"###|ssid = " <<list[i].ssid <<"rssi = " << static_cast<int>(list[i].rssi) <<", authmode = " <<authmode <<endl;
+                    cout <<"###|ssid = " <<list[i].ssid <<" rssi = " << static_cast<int>(list[i].rssi) <<", authmode = " <<authmode <<endl;
                }
                free(list);
                printf("###|Connecting to a LAN network . . .\n");
@@ -201,130 +426,19 @@ esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
 }
 
 
-//get sockaddr, IPv4 or IPv6
-//accepts sockaddr_storage as input only
-void *get_in_addr(struct sockaddr *sa)
-{
-     if (sa->sa_family == AF_INET) //if it's IPv4
-          return &(((struct sockaddr_in*)sa)->sin_addr);
-     else //it's IPv6
-          return &(((struct sockaddr_in6*)sa)->sin6_addr);
-}
-
-//called by xTaskCreate in main
-static void internet_app(void *arg)
-{
-     tcpip_adapter_ip_info_t ip_info;
-     ESP_ERROR_CHECK(tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip_info));
-     printf("###|esp32 : IP Address  : %s\n", ip4addr_ntoa(&ip_info.ip));
-     printf("###|esp32 : Subnet Mask : %s\n", ip4addr_ntoa(&ip_info.netmask));
-     printf("###|esp32 : Gateway     : %s\n", ip4addr_ntoa(&ip_info.gw));
-     //server-side code
-     int sock_listen = NULL, sock_new = NULL, numbytes;
-     char buf[MAXDATASIZE];
-     struct addrinfo hints, *servinfo, *p;
-     struct sockaddr_storage their_addr; //connector's address information. IPv4 or IPv6
-     socklen_t sin_size;
-     char s[INET6_ADDRSTRLEN];
-     int rv;
-
-     memset(&hints, 0, sizeof(hints));
-     hints.ai_family = AF_UNSPEC; //use either IPv4 or IPv6
-     hints.ai_socktype = SOCK_STREAM; //TCP packets
-     hints.ai_flags = AI_PASSIVE; //use my IP, since I am a server
-
-     if ( (rv = getaddrinfo(NULL, PORT_ACCEPT, &hints, &servinfo)) == 0 )
-     {
-          //loop through all the results and bind to the first we can
-          for (p=servinfo ; p != NULL ; p=p->ai_next)
-          {
-               if ( (sock_listen = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)
-               {
-                    printf("###|No luck in socket...\n");
-                    continue;
-               }
-               //if (setsockopt) // manipulate options for the socket
-               if (bind(sock_listen, p->ai_addr, p->ai_addrlen))
-               {
-                    printf("###|No luck in bind...\n");
-                    close(sock_listen);
-                    continue;
-               }
-               //print bind settings
-               void* addr;
-               string ipver;
-               // get the pointer to the address itself,
-               // different fields in IPv4 and IPv6:
-               if (p->ai_family == AF_INET) // IPv4
-               {
-                    struct sockaddr_in *ipv4 = (struct sockaddr_in *)p->ai_addr;
-                    addr = &(ipv4->sin_addr);
-                    ipver = "IPv4";
-               } else // IPv6
-               {
-                    struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)p->ai_addr;
-                    addr = &(ipv6->sin6_addr);
-                    ipver = "IPv6";
-               }
-               // convert the IP to a string and print it:
-               inet_ntop(p->ai_family, addr, s, sizeof(s));
-               //printf("###|Server binded to --> %s: %s  port %s\n", ipver, s, PORT_ACCEPT);
-               cout <<"###|Server binded to --> " <<ipver <<": " <<s  <<"port " <<PORT_ACCEPT <<endl;
-               break;
-          }
-          freeaddrinfo(servinfo); //all done with this structure.
-          if (p != NULL)
-          {
-                    if (listen(sock_listen, BACKLOG) != -1)
-                    {
-                         printf("###|Server listening . . .\n");
-                         while(true) //main accept() loop
-                         {
-                              sin_size = sizeof(their_addr);
-                              sock_new = accept(sock_listen, (struct sockaddr *)&their_addr, &sin_size);
-                              if (sock_new == -1)
-                              {
-                                   perror("###|Cannot accept\n");
-                                   close(sock_new);
-                                   continue;
-                              }
-                              inet_ntop(their_addr.ss_family, //convert IP customer addreess to printable
-                                   get_in_addr((struct sockaddr*)&their_addr ), s, sizeof(s));
-                              printf("###|SERVER : got connection from %s\n", s);
-
-                              if ((numbytes = recv(sock_new, buf, MAXDATASIZE-1, 0)) == -1) //returns the number of bytes read
-                              {
-                                   perror("###|Cannot recv\n");
-                                   close(sock_new);
-                                   continue;
-                              }
-                              buf[numbytes] = '\0';
-                              char response[2*MAXDATASIZE] = "You said :";
-                              strcat(response, buf);
-                              if (send(sock_new, response, strlen(response)+1, 0) == -1)
-                              {
-                                   perror("send");
-                                   close(sock_new);
-                                   continue;
-                              }
-                              close(sock_new);
-                         }
-                    }else
-                         perror("###|Cannot listen\n");
-          }else
-               perror("###|socket_listen is NULL\n");
-     }else
-          perror("###|Cannot getaddrinfo\n");
-     while(1)
-     {
-          vTaskDelay(10 / portTICK_PERIOD_MS);
-     }
-}
 
 void app_main()
 {
      //call blinky !
-     printf("###|ezPanda ! \n");
+     printf("#########################################################\n");
+     printf("#######################| ezPanda |#######################\n");
+     printf("######################################################### \n");
+     printf("╲╲╲╲◢◣▁▁▁▁▁◢◣╱╱╱╱\n");
+     printf("╲╲╲╲◥▔▔▔▔▔▔▔◤╱╱╱╱\n");
+     printf("╲╲╲╲▕▏▇▏┈▕▇▕▏╱╱╱╱\n");
+     printf("╲╲╲╲▕▏◤┈▼┈◥▕▏╱╱╱╱\n");
+     printf("╲╲╲╲▕▏╲╰━╯╱▕▏╱╱╱╱\n");
+     printf("#########################################################\n");
      //make a blinky !
      gpio_set_direction(GPIO_BLINKY_LED, GPIO_MODE_OUTPUT);
      LED_STATE = 0;
@@ -360,31 +474,60 @@ void app_main()
      strcpy((char*)sta_config.sta.ssid, WIFI_SSID);
      strcpy((char*)sta_config.sta.password, WIFI_PASSWORD);
      sta_config.sta.bssid_set = 0;
-     /*
-     wifi_scan_config_t scanConf = //scan configurating
-     {
-          .ssid = NULL,
-          .bssid = NULL,
-          .channel = 0,
-          .show_hidden = 1
-     };
-
-     wifi_config_t sta_config = //station configuration
-     {
-          .sta =
-          {
-               .ssid = WIFI_SSID,
-               .password = WIFI_PASSWORD,
-               .bssid_set = 0
-          }
-     };*/
 
      ESP_ERROR_CHECK(esp_wifi_set_auto_connect(false)); //disable auto connect
      ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
      ESP_ERROR_CHECK(esp_wifi_start()); //start wifi, according to current configuration
      ESP_ERROR_CHECK(esp_wifi_scan_start(&scanConf, 0)); //blocking (true) or non blocking (false) mode by the second parameter
 
-     //wait indefinetely untill esp32 to connected
+     //wait indefinetely untill esp32 gets connected
      xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
-     xTaskCreate(internet_app, "connected_to_wifi_program", 2048, NULL, 5, NULL);
+
+
+     //----------------------------INTERNET !---------------------------------//
+     tcpip_adapter_ip_info_t ip_info;
+     ESP_ERROR_CHECK(tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip_info));
+     printf("###|esp32 : IP Address  : %s\n", ip4addr_ntoa(&ip_info.ip));
+     printf("###|esp32 : Subnet Mask : %s\n", ip4addr_ntoa(&ip_info.netmask));
+     printf("###|esp32 : Gateway     : %s\n", ip4addr_ntoa(&ip_info.gw));
+
+     //server-side code
+     /*
+     try
+     {
+          Server server("9865");
+          server.createSocket();
+          while (true)
+          {
+               string request = server.wait4ClientRequest();
+               string response = "You said :" + request;
+               server.sendData(response);
+               server.closeClientSocket();
+          }
+     }catch (SocketException &e)
+     {
+          cout <<e.what() << e.getMsg();
+     }
+     */
+
+     //client-side code
+     while(1)
+     {
+          try
+          {
+               Client client;
+               client.createSocket(EZPANDA_IP, "10000");
+               vTaskDelay(1500 / portTICK_PERIOD_MS);
+               client.sendData("ESP32 here. you savy ?");
+               string response = client.recvData();
+               cout <<response;
+               client.closeClientSocket();
+          }catch (SocketException &e)
+          {
+               printf("###|Inside exception\n");
+               cout <<e.what() << e.getMsg();
+          }
+
+          vTaskDelay(2000 / portTICK_PERIOD_MS);
+     }
 }

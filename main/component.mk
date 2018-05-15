@@ -9,3 +9,4 @@
 
 #include stdc++, for C++ compilation
 COMPONENT_ADD_LDFLAGS=-lstdc++ -l$(COMPONENT_NAME)
+CXXFLAGS+=-fexceptions
