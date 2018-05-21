@@ -45,6 +45,7 @@ extern "C" {
      #include <lwip/sockets.h>
      #include <lwip/netdb.h> //e.g. freeaddrinfo() ...
 
+     #include <pthread.h>
 //     void IRAM_ATTR timerHandler(void *para);
 //     static void tg0_timer_init(int timer_idx, bool auto_reload, double timer_interval_sec);
 //     esp_err_t wifi_event_handler(void *ctx, system_event_t *event);
@@ -57,6 +58,7 @@ extern "C" {
 #define TEST_WITH_RELOAD 1
 
 #define GPIO_BLINKY_LED GPIO_NUM_5
+#define GPIO_APACHE_LED GPIO_NUM_4
 static bool LED_STATE;
 
 #define WIFI_SSID CONFIG_ESP_SSID_toConnect
@@ -265,6 +267,7 @@ class Client: public Connection
           char IPaddress[INET6_ADDRSTRLEN];
      public:
           Client();
+          ~Client() { close(socket_comm); }
           void createSocket(string serverName, string service);
 };
 
@@ -312,7 +315,7 @@ void Client::createSocket(string serverName, string service)
      }
      inet_ntop(p->ai_family, get_in_addr((struct sockaddr *)p->ai_addr),
           IPaddress, sizeof(IPaddress));
-     printf("client: connecting to %s\n", IPaddress);
+     printf("client: connecting to %s on port %s\n", IPaddress, port_service);
 
      freeaddrinfo(server_info); // all done with this structure
 }
@@ -426,6 +429,60 @@ esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
 }
 
 
+//this function is run by the server thread
+#define PORTB "4567" // backward connection
+void *get_in_addr(struct sockaddr *sa)
+{
+	if (sa->sa_family == AF_INET) {
+		return &(((struct sockaddr_in*)sa)->sin_addr);
+	}
+	return &(((struct sockaddr_in6*)sa)->sin6_addr);
+}
+
+void *servering(void *args)
+{
+
+
+     cout <<"###|Starting servering thread\n";
+     string command, response="esp here reee !\n";
+
+     //tdlt
+     bool APACHE_LED_STATE = 0;
+     gpio_set_direction(GPIO_APACHE_LED, GPIO_MODE_OUTPUT);
+     gpio_set_level(GPIO_APACHE_LED, APACHE_LED_STATE);
+     try
+     {
+          Client servableClient;
+          servableClient.createSocket(EZPANDA_IP, "4567");
+
+          while(1)
+          {
+               command = "";
+               response = "";
+               command = servableClient.recvData();
+               cout <<"###|apache command :" <<command <<endl;
+
+               //proccess command
+               command = command.substr (0,command.length()-5);
+               if (command.at(0) == '?')
+               {
+                    APACHE_LED_STATE = !APACHE_LED_STATE;
+                    gpio_set_level(GPIO_APACHE_LED, APACHE_LED_STATE);
+               }
+
+               response = "ESP:" + command + "!\n";
+               servableClient.sendData(response);
+               cout <<"###|apache response :" <<response <<endl;
+
+               //vTaskDelay(1000 / portTICK_PERIOD_MS);
+          }
+          servableClient.closeClientSocket();
+     }catch (SocketException &e)
+     {
+          cout <<e.what() << e.getMsg() <<endl;
+     }
+     return NULL;
+}
 
 void app_main()
 {
@@ -483,13 +540,17 @@ void app_main()
      //wait indefinetely untill esp32 gets connected
      xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
 
-
      //----------------------------INTERNET !---------------------------------//
      tcpip_adapter_ip_info_t ip_info;
      ESP_ERROR_CHECK(tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip_info));
      printf("###|esp32 : IP Address  : %s\n", ip4addr_ntoa(&ip_info.ip));
      printf("###|esp32 : Subnet Mask : %s\n", ip4addr_ntoa(&ip_info.netmask));
      printf("###|esp32 : Gateway     : %s\n", ip4addr_ntoa(&ip_info.gw));
+
+     //creating pthread
+     pthread_t server_thread;
+     if (pthread_create(&server_thread, NULL, servering, NULL))
+          printf("###|COULD NOT start server thread.\n");
 
      //server-side code
      /*
@@ -516,18 +577,23 @@ void app_main()
           try
           {
                Client client;
-               client.createSocket(EZPANDA_IP, "10000");
+               client.createSocket(EZPANDA_IP, "5678");
                vTaskDelay(1500 / portTICK_PERIOD_MS);
-               client.sendData("ESP32 here. you savy ?");
+               client.sendData("Light1:1\nLight2:0\nServo:1\nEnergyTransmitter:0!\n");
                string response = client.recvData();
-               cout <<response;
+               cout <<"###|" <<response <<endl;
                client.closeClientSocket();
           }catch (SocketException &e)
           {
-               printf("###|Inside exception\n");
-               cout <<e.what() << e.getMsg();
+               cout <<e.what() << e.getMsg() <<endl;
           }
 
-          vTaskDelay(2000 / portTICK_PERIOD_MS);
+          vTaskDelay(25000 / portTICK_PERIOD_MS);
+     }
+
+     /* wait for the server thread to finish */
+     if(pthread_join(server_thread, NULL)) {
+          printf("###|COULD NOT join server thread.\n");
+          esp_restart();
      }
 }
