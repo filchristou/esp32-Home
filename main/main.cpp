@@ -1,9 +1,3 @@
-/*
-     This a a little server application.
-     telnet <ESP-IP address> 8080
-     and a "Hello World" packet will be sent back to you
-*/
-
 //ezPanda IP address is 83.212.106.103
 //listens to port 10000
 
@@ -14,38 +8,46 @@ using namespace std;
 #include <iostream>
 #include <string>
 #include <exception>
+#include <unordered_map>
 
 extern "C" {
      void app_main();
 }
-     #include <inttypes.h> //for printing uint16_t , ... , etc
+	#include <inttypes.h> //for printing uint16_t , ... , etc
 
-     #include "freertos/FreeRTOS.h"
-     #include "freertos/queue.h"
-     #include "freertos/task.h"
-     #include "freertos/event_groups.h"
+	#include "freertos/FreeRTOS.h"
+	#include "freertos/queue.h"
+	#include "freertos/task.h"
+	#include "freertos/event_groups.h"
 
-     #include "driver/timer.h"
+	#include "driver/timer.h"
 
-     #include "nvs_flash.h" //for nvs_flash_init();
+	#include "nvs_flash.h" //for nvs_flash_init();
 
-     #include <esp_event.h>
-     #include <esp_event_loop.h>
-     #include <esp_wifi.h>
-     #include <esp_err.h> //for the ESP_ERROR_CHECK()
+	#include <esp_event.h>
+	#include <esp_event_loop.h>
+	#include <esp_wifi.h>
+	#include <esp_err.h> //for the ESP_ERROR_CHECK()
+	#include "esp_log.h"
 
-     //for connecting to an AP
-     #include <tcpip_adapter.h>
-     #include <esp_system.h>
+	//for connecting to an AP
+	#include <tcpip_adapter.h>
+	#include <esp_system.h>
 
-     #include "esp_types.h"
-     #include "soc/timer_group_struct.h"
-     #include "driver/periph_ctrl.h"
+	#include "esp_types.h"
+	#include "soc/timer_group_struct.h"
+	#include "driver/periph_ctrl.h"
 
-     #include <lwip/sockets.h>
-     #include <lwip/netdb.h> //e.g. freeaddrinfo() ...
+	#include <lwip/sockets.h>
+	#include <lwip/netdb.h> //e.g. freeaddrinfo() ...
 
-     #include <pthread.h>
+	//bluetooth libraries
+	#include "esp_bt.h"
+	#include "esp_bt_main.h"
+	#include "esp_bt_device.h"
+	#include "esp_gap_bt_api.h"
+
+	#include <pthread.h>
 //     void IRAM_ATTR timerHandler(void *para);
 //     static void tg0_timer_init(int timer_idx, bool auto_reload, double timer_interval_sec);
 //     esp_err_t wifi_event_handler(void *ctx, system_event_t *event);
@@ -70,8 +72,14 @@ static bool LED_STATE;
 #define PORT_ACCEPT "8765" //the port users will be connecting to
 #define EZPANDA_IP "83.212.106.103"
 
-static EventGroupHandle_t wifi_event_group; //to handle and sychronize wifi events
-const int CONNECTED_BIT = BIT0; //when this bit is set, esp32 is connected to a wifi LAN network
+#define GAP_TAG			"GAP"
+#define USER_TAG		"USER_INFO"
+
+#define CONNECTED_BIT 	(1 << 0) //when this bit is set, esp32 is connected to a wifi LAN network
+#define BLUETOOTH_SCAN_BIT 	(1 << 1) //when this bit is set, esp32 has finished a bluetooth scan
+
+
+static EventGroupHandle_t xEventBits; //to handle and sychronize wifi events
 
 //the Exception
 class SocketException: public exception
@@ -110,7 +118,7 @@ class SocketException: public exception
           }
 };
 
-//-----------------------------CLASS DECLARATTION START-----------------------------------//
+//--------------------------------CLASS DECLARATTION START--------------------------------//
 class Connection
 {
      protected:
@@ -202,7 +210,7 @@ void Server::createSocket()
           }
 
 
-          //---------------------------------- print bind settings ----------------------------------//
+          //print bind settings
           void* addr;
           string ipver;
           //* get the pointer to the address itself,
@@ -222,7 +230,6 @@ void Server::createSocket()
           //* convert the IP to a string and print it:
           inet_ntop(p->ai_family, addr, IPaddress, sizeof(IPaddress));
           cout <<"###|Server binded to --> " <<ipver <<": " <<IPaddress  <<"port " <<port_service <<endl;
-          //-----------------------------------------------------------------------------------------//
           break;
      }
      if (p == NULL)
@@ -320,8 +327,8 @@ void Client::createSocket(string serverName, string service)
      freeaddrinfo(server_info); // all done with this structure
 }
 
-//---------------------CLASS DECLARATTION OVER---------------------------//
 
+//-------------------------------- TIMER --------------------------------//
 void IRAM_ATTR timerHandler(void *para)
 {
      int timer_idx = (int) para;
@@ -365,6 +372,7 @@ static void tg0_timer_init(timer_idx_t timer_idx, bool auto_reload, double timer
      timer_start(TIMER_GROUP_0, timer_idx);
 }
 
+//-------------------------------- WIFI --------------------------------//
 esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
 {
      switch(event->event_id)
@@ -413,13 +421,13 @@ esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
                //ipConnected = event->event_info.got_ip.ip_info.ip ;
                //printf ("###|Our IP address is " IPSTR "\n", IP2STR(&ipConnected));
                //printf ("###|We are now connected to a Access Point.");
-               xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
+               xEventGroupSetBits(xEventBits, CONNECTED_BIT);
                break;
           }
           case SYSTEM_EVENT_STA_DISCONNECTED:
           {
                printf("###|Disconnected from wifi\n");
-               xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
+               xEventGroupClearBits(xEventBits, CONNECTED_BIT);
                break;
           }
           default:
@@ -429,17 +437,223 @@ esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
 }
 
 
-//this function is run by the server thread
-#define PORTB "4567" // backward connection
-void *get_in_addr(struct sockaddr *sa)
+//-------------------------------- WIFI-over --------------------------------//
+//-------------------------------- BLUETOOTH --------------------------------//
+std::unordered_map<std::string, std::string> bdaName_map;
+
+typedef enum {
+    APP_GAP_STATE_IDLE = 0,
+    APP_GAP_STATE_DEVICE_DISCOVERING,
+    APP_GAP_STATE_DEVICE_DISCOVER_COMPLETE,
+    APP_GAP_STATE_SERVICE_DISCOVERING,
+    APP_GAP_STATE_SERVICE_DISCOVER_COMPLETE,
+} app_gap_state_t;
+
+typedef struct {
+    bool dev_found;
+    uint8_t bdname_len;
+    uint8_t eir_len;
+    uint8_t rssi;
+    uint32_t cod;
+    uint8_t eir[ESP_BT_GAP_EIR_DATA_LEN];
+    uint8_t bdname[ESP_BT_GAP_MAX_BDNAME_LEN + 1];
+    esp_bd_addr_t bda;
+    app_gap_state_t state;
+} app_gap_cb_t;
+
+static app_gap_cb_t m_dev_info;
+
+static char *bda2str(esp_bd_addr_t bda, char *str, size_t size)
 {
-	if (sa->sa_family == AF_INET) {
-		return &(((struct sockaddr_in*)sa)->sin_addr);
-	}
-	return &(((struct sockaddr_in6*)sa)->sin6_addr);
+    if (bda == NULL || str == NULL || size < 18) {
+        return NULL;
+    }
+
+    uint8_t *p = bda;
+    sprintf(str, "%02x:%02x:%02x:%02x:%02x:%02x",
+            p[0], p[1], p[2], p[3], p[4], p[5]);
+    return str;
 }
 
-void *servering(void *args)
+static bool get_name_from_eir(uint8_t *eir, uint8_t *bdname, uint8_t *bdname_len)
+{
+    uint8_t *rmt_bdname = NULL;
+    uint8_t rmt_bdname_len = 0;
+
+    if (!eir) {
+        return false;
+    }
+
+    rmt_bdname = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, &rmt_bdname_len);
+    if (!rmt_bdname) {
+        rmt_bdname = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME, &rmt_bdname_len);
+    }
+
+    if (rmt_bdname) {
+        if (rmt_bdname_len > ESP_BT_GAP_MAX_BDNAME_LEN) {
+            rmt_bdname_len = ESP_BT_GAP_MAX_BDNAME_LEN;
+        }
+
+        if (bdname) {
+            memcpy(bdname, rmt_bdname, rmt_bdname_len);
+            bdname[rmt_bdname_len] = '\0';
+        }
+        if (bdname_len) {
+            *bdname_len = rmt_bdname_len;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static void update_device_info(esp_bt_gap_cb_param_t *param)
+{
+    char bda_str[18];
+    uint32_t cod = 0;
+    int32_t rssi = -129; /* invalid value */
+    esp_bt_gap_dev_prop_t *p;
+	
+	bda2str(param->disc_res.bda, bda_str, 18);
+	//continue only if bda (Bluetooth Device Address is new)
+	//bda_str carries the bda string. owo. 
+	if (bdaName_map.count(std::string(bda_str)) <= 0) //if bda key doesn't exist
+	{
+		//store bda in a global variable, so that I can clean that when bt_device_scan is over
+		//I need every scan to be independent and have no clue about the previous
+
+		for (int i = 0; i < param->disc_res.num_prop; i++) {
+			p = param->disc_res.prop + i;
+			switch (p->type) {
+			case ESP_BT_GAP_DEV_PROP_COD:
+				cod = *(uint32_t *)(p->val);
+				//ESP_LOGI(GAP_TAG, "--Class of Device: 0x%x", cod);
+				break;
+			case ESP_BT_GAP_DEV_PROP_RSSI:
+				rssi = *(int8_t *)(p->val);
+				//ESP_LOGI(GAP_TAG, "--RSSI: %d", rssi);
+				break;
+			case ESP_BT_GAP_DEV_PROP_BDNAME:
+			default:
+				break;
+			}
+		}
+
+		/* search for device with MAJOR service class as "rendering" in COD (Class of Device) */
+		app_gap_cb_t *p_dev = &m_dev_info;
+		if (p_dev->dev_found && 0 != memcmp(param->disc_res.bda, p_dev->bda, ESP_BD_ADDR_LEN)) 
+		{
+			return;
+		}
+
+		//second condition: a device with Major device type "PHONE" in the Class of Device Field
+		if (!esp_bt_gap_is_valid_cod(cod)) // ||
+	//            !(esp_bt_gap_get_cod_major_dev(cod) == ESP_BT_COD_MAJOR_DEV_PHONE)) 
+		{
+			return;
+		}
+
+		memcpy(p_dev->bda, param->disc_res.bda, ESP_BD_ADDR_LEN);
+		for (int i = 0; i < param->disc_res.num_prop; i++) {
+			p = param->disc_res.prop + i;
+			switch (p->type) {
+			case ESP_BT_GAP_DEV_PROP_COD:
+				p_dev->cod = *(uint32_t *)(p->val);
+				break;
+			case ESP_BT_GAP_DEV_PROP_RSSI:
+				p_dev->rssi = *(int8_t *)(p->val);
+				break;
+			case ESP_BT_GAP_DEV_PROP_BDNAME: {
+				uint8_t len = (p->len > ESP_BT_GAP_MAX_BDNAME_LEN) ? ESP_BT_GAP_MAX_BDNAME_LEN :
+							  (uint8_t)p->len;
+				memcpy(p_dev->bdname, (uint8_t *)(p->val), len);
+				p_dev->bdname[len] = '\0';
+				p_dev->bdname_len = len;
+				break;
+			}
+			case ESP_BT_GAP_DEV_PROP_EIR: {
+				memcpy(p_dev->eir, (uint8_t *)(p->val), p->len);
+				p_dev->eir_len = p->len;
+				break;
+			}
+			default:
+				break;
+			}
+		}
+
+		get_name_from_eir(p_dev->eir, p_dev->bdname, &p_dev->bdname_len);
+		ESP_LOGI(GAP_TAG, "Device found: %s", bda2str(param->disc_res.bda, bda_str, 18));
+		ESP_LOGI(GAP_TAG, "--Class of Device: 0x%x", cod);
+		ESP_LOGI(GAP_TAG, "--RSSI: %d", rssi);
+		ESP_LOGI(GAP_TAG, "Found a target device, address %s, name %s", bda_str, p_dev->bdname);
+		//insert to unordered map
+		bdaName_map.insert( {std::string(bda_str), std::string((char *)p_dev->bdname)} );
+	}
+}
+
+
+void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
+{
+    switch (event) { //a device found !
+    case ESP_BT_GAP_DISC_RES_EVT: {
+        update_device_info(param);
+        break;
+    }
+	case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {
+        if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
+            ESP_LOGI(GAP_TAG, "Device discovery stopped.");
+        } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED) {
+            ESP_LOGI(GAP_TAG, "Discovery started.");
+        }
+        break;
+    } 
+	case ESP_BT_GAP_RMT_SRVC_REC_EVT:
+    default: {
+        ESP_LOGI(GAP_TAG, "event not 'cased': %d", event);
+        break;
+    }
+    }
+    return;
+}
+
+static void bt_app_gap_start_up(void *arg) //bluetooth TASK
+{
+	while (true)
+	{
+		const char* dev_name = "ESP_GAP_INQRUIY";
+		esp_bt_dev_set_device_name(dev_name);
+
+		/* set discoverable and connectable mode, wait to be connected */
+		esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
+
+		/* register GAP callback function */
+		esp_bt_gap_register_callback(bt_app_gap_cb);
+
+		/* inititialize device information and status */
+		app_gap_cb_t *p_dev = &m_dev_info;
+		memset(p_dev, 0, sizeof(app_gap_cb_t));
+
+		/* start to discover nearby Bluetooth devices */
+		p_dev->state = APP_GAP_STATE_DEVICE_DISCOVERING;
+		esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+
+		vTaskDelay(20000 / portTICK_PERIOD_MS);
+		ESP_LOGI(GAP_TAG, "Cancel device discovery ...");
+		esp_bt_gap_cancel_discovery();
+		//wait 3 seconds more (handling already thrown exceptions)
+		vTaskDelay(3000 / portTICK_PERIOD_MS);
+
+		//signal main task to handle the event : bluetooth devices scanned
+		xEventGroupSetBits(xEventBits, BLUETOOTH_SCAN_BIT);
+
+		vTaskDelay(300000 / portTICK_PERIOD_MS); //wait for 5 minutes before scanning again
+	}
+}
+
+
+
+//-------------------------------- SERVER THREAD --------------------------------//
+void *servering(void *args)//this function is run by the server thread
 {
 
 
@@ -486,114 +700,193 @@ void *servering(void *args)
 
 void app_main()
 {
-     //call blinky !
-     printf("#########################################################\n");
-     printf("#######################| ezPanda |#######################\n");
-     printf("######################################################### \n");
-     printf("╲╲╲╲◢◣▁▁▁▁▁◢◣╱╱╱╱\n");
-     printf("╲╲╲╲◥▔▔▔▔▔▔▔◤╱╱╱╱\n");
-     printf("╲╲╲╲▕▏▇▏┈▕▇▕▏╱╱╱╱\n");
-     printf("╲╲╲╲▕▏◤┈▼┈◥▕▏╱╱╱╱\n");
-     printf("╲╲╲╲▕▏╲╰━╯╱▕▏╱╱╱╱\n");
-     printf("#########################################################\n");
-     //make a blinky !
-     gpio_set_direction(GPIO_BLINKY_LED, GPIO_MODE_OUTPUT);
-     LED_STATE = 0;
-     gpio_set_level(GPIO_BLINKY_LED, LED_STATE);
-     tg0_timer_init(TIMER_0, TEST_WITH_RELOAD, TIMER_LED);
-     //   3)given that we have an architecture of 4 byte stack width (one word),
-     // the xTaskCreate reserves 2048*4 = 8072bytes = 8kB
-     //   5)Priorities can be assigned
-     // from 0, which is the lowest priority, to (configMAX_PRIORITIES – 1), which
-     // is the highest priority
-     ////xTaskCreate(timer_example_evt_task, "timer_evt_task", 2048, NULL, 5, NULL);
+	//call blinky !
+	printf("#########################################################\n");
+	printf("#######################| ezPanda |#######################\n");
+	printf("######################################################### \n");
+	printf("                    ╲╲╲╲◢◣▁▁▁▁▁◢◣╱╱╱╱\n");
+	printf("                    ╲╲╲╲◥▔▔▔▔▔▔▔◤╱╱╱╱\n");
+	printf("                    ╲╲╲╲▕▏▇▏┈▕▇▕▏╱╱╱╱\n");
+	printf("                    ╲╲╲╲▕▏◤┈▼┈◥▕▏╱╱╱╱\n");
+	printf("                    ╲╲╲╲▕▏╲╰━╯╱▕▏╱╱╱╱\n");
+	printf("#########################################################\n");
+	//make a blinky !
+	gpio_set_direction(GPIO_BLINKY_LED, GPIO_MODE_OUTPUT);
+	LED_STATE = 0;
+	gpio_set_level(GPIO_BLINKY_LED, LED_STATE);
+	tg0_timer_init(TIMER_0, TEST_WITH_RELOAD, TIMER_LED);
+	//   3)given that we have an architecture of 4 byte stack width (one word),
+	// the xTaskCreate reserves 2048*4 = 8072bytes = 8kB
+	//   5)Priorities can be assigned
+	// from 0, which is the lowest priority, to (configMAX_PRIORITIES – 1), which
+	// is the highest priority
+	////xTaskCreate(timer_example_evt_task, "timer_evt_task", 2048, NULL, 5, NULL);
 
-     //create an event group to handle wifi events and sychronize with app_main
-     wifi_event_group = xEventGroupCreate();
+	//create an event group to handle wifi events and sychronize with app_main
+	xEventBits = xEventGroupCreate();
 
-     //continue to main program
-     nvs_flash_init();
-     tcpip_adapter_init();
-     ESP_ERROR_CHECK(esp_event_loop_init(wifi_event_handler, NULL)); //handler for wifi events
-     wifi_init_config_t cgf = WIFI_INIT_CONFIG_DEFAULT(); //create object for initialization of wifi
-     ESP_ERROR_CHECK(esp_wifi_init(&cgf)); //initialize wifi
-     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM)); //default value is FLASH.
-     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA)); //make esp32 a station. not a Access Point
+	//continue to main program
+	esp_err_t ret;
+	ret = nvs_flash_init();
+	if (ret == ESP_ERR_NVS_NO_FREE_PAGES) {
+		ESP_ERROR_CHECK(nvs_flash_erase());
+		ret = nvs_flash_init();
+	}
+	ESP_ERROR_CHECK( ret );
 
-     wifi_scan_config_t scanConf = {}; //scan configurating
-     //initialize
-     scanConf.ssid = NULL;
-     scanConf.bssid = NULL;
-     scanConf.channel = 0;
-     scanConf.show_hidden = 1;
+	tcpip_adapter_init();
+	ESP_ERROR_CHECK(esp_event_loop_init(wifi_event_handler, NULL)); //handler for wifi events
+	wifi_init_config_t cgf = WIFI_INIT_CONFIG_DEFAULT(); //create object for initialization of wifi
+	ESP_ERROR_CHECK(esp_wifi_init(&cgf)); //initialize wifi
+	ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM)); //default value is FLASH.
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA)); //make esp32 a station. not a Access Point
 
-     wifi_config_t sta_config = {}; //station configuration
-     strcpy((char*)sta_config.sta.ssid, WIFI_SSID);
-     strcpy((char*)sta_config.sta.password, WIFI_PASSWORD);
-     sta_config.sta.bssid_set = 0;
+	wifi_scan_config_t scanConf = {}; //scan configurating
+	//initialize
+	scanConf.ssid = NULL;
+	scanConf.bssid = NULL;
+	scanConf.channel = 0;
+	scanConf.show_hidden = 1;
 
-     ESP_ERROR_CHECK(esp_wifi_set_auto_connect(false)); //disable auto connect
-     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
-     ESP_ERROR_CHECK(esp_wifi_start()); //start wifi, according to current configuration
-     ESP_ERROR_CHECK(esp_wifi_scan_start(&scanConf, 0)); //blocking (true) or non blocking (false) mode by the second parameter
+	wifi_config_t sta_config = {}; //station configuration
+	strcpy((char*)sta_config.sta.ssid, WIFI_SSID);
+	strcpy((char*)sta_config.sta.password, WIFI_PASSWORD);
+	sta_config.sta.bssid_set = 0;
 
-     //wait indefinetely untill esp32 gets connected
-     xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
+	ESP_ERROR_CHECK(esp_wifi_set_auto_connect(false)); //disable auto connect
+	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+	ESP_ERROR_CHECK(esp_wifi_start()); //start wifi, according to current configuration
+	ESP_ERROR_CHECK(esp_wifi_scan_start(&scanConf, 0)); //blocking (true) or non blocking (false) mode by the second parameter
 
-     //----------------------------INTERNET !---------------------------------//
-     tcpip_adapter_ip_info_t ip_info;
-     ESP_ERROR_CHECK(tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip_info));
-     printf("###|esp32 : IP Address  : %s\n", ip4addr_ntoa(&ip_info.ip));
-     printf("###|esp32 : Subnet Mask : %s\n", ip4addr_ntoa(&ip_info.netmask));
-     printf("###|esp32 : Gateway     : %s\n", ip4addr_ntoa(&ip_info.gw));
+	//--------------------------Bluetooth configuration---------------------------//
+	esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    if ((ret = esp_bt_controller_init(&bt_cfg)) != ESP_OK) {
+        ESP_LOGE(GAP_TAG, "%s initialize controller failed: %s\n", __func__, esp_err_to_name(ret));
+        return;
+    }
 
-     //creating pthread
-     pthread_t server_thread;
-     if (pthread_create(&server_thread, NULL, servering, NULL))
-          printf("###|COULD NOT start server thread.\n");
+    if ((ret = esp_bt_controller_enable(ESP_BT_MODE_BTDM)) != ESP_OK) {
+        ESP_LOGE(GAP_TAG, "%s enable controller failed: %s\n", __func__, esp_err_to_name(ret));
+        return;
+    }
 
-     //server-side code
-     /*
-     try
-     {
-          Server server("9865");
-          server.createSocket();
-          while (true)
-          {
-               string request = server.wait4ClientRequest();
-               string response = "You said :" + request;
-               server.sendData(response);
-               server.closeClientSocket();
-          }
-     }catch (SocketException &e)
-     {
-          cout <<e.what() << e.getMsg();
-     }
-     */
+    if ((ret = esp_bluedroid_init()) != ESP_OK) {
+        ESP_LOGE(GAP_TAG, "%s initialize bluedroid failed: %s\n", __func__, esp_err_to_name(ret));
+        return;
+    }
 
-     //client-side code
-     while(1)
-     {
-          try
-          {
-               Client client;
-               client.createSocket(EZPANDA_IP, "5678");
-               vTaskDelay(1500 / portTICK_PERIOD_MS);
-               client.sendData("Light1:1\nLight2:0\nServo:1\nEnergyTransmitter:0!\n");
-               string response = client.recvData();
-               cout <<"###|" <<response <<endl;
-               client.closeClientSocket();
-          }catch (SocketException &e)
-          {
-               cout <<e.what() << e.getMsg() <<endl;
-          }
+    if ((ret = esp_bluedroid_enable()) != ESP_OK) {
+        ESP_LOGE(GAP_TAG, "%s enable bluedroid failed: %s\n", __func__, esp_err_to_name(ret));
+        return;
+    }
 
-          vTaskDelay(25000 / portTICK_PERIOD_MS);
-     }
+	//wait indefinetely untill esp32 gets connected
+	xEventGroupWaitBits(xEventBits, CONNECTED_BIT, false, true, portMAX_DELAY);
 
-     /* wait for the server thread to finish */
-     if(pthread_join(server_thread, NULL)) {
-          printf("###|COULD NOT join server thread.\n");
-          esp_restart();
-     }
+	//----------------------------INTERNET !---------------------------------//
+	tcpip_adapter_ip_info_t ip_info;
+	ESP_ERROR_CHECK(tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip_info));
+	printf("###|esp32 : IP Address  : %s\n", ip4addr_ntoa(&ip_info.ip));
+	printf("###|esp32 : Subnet Mask : %s\n", ip4addr_ntoa(&ip_info.netmask));
+	printf("###|esp32 : Gateway     : %s\n", ip4addr_ntoa(&ip_info.gw));
+	
+	Client client;
+	//send initiatting data
+	try
+	{
+		client.createSocket(EZPANDA_IP, "5678");
+		vTaskDelay(1500 / portTICK_PERIOD_MS);
+		client.sendData("<Light1:1\nLight2:0\nServo:1\nEnergyTransmitter:0\n!\n"); //e.g.
+		string response = client.recvData();
+		cout <<"###|" <<response <<endl;
+		client.closeClientSocket();
+	}catch (SocketException &e)
+	{
+		cout <<e.what() << e.getMsg() <<endl;
+	}
+	
+	
+
+	//start bluetooth task
+	xTaskCreate(bt_app_gap_start_up, "connected_to_wifi_program", 2048, NULL, 5, NULL);
+
+    //creating pthread for server 
+    pthread_t server_thread;
+    if (pthread_create(&server_thread, NULL, servering, NULL))
+         printf("###|COULD NOT start server thread.\n");
+	
+	while (true)
+	{
+		string deviceReport = "@";
+		//@arg3 : clear the bits we wait for. 
+		xEventGroupWaitBits(xEventBits, BLUETOOTH_SCAN_BIT, pdTRUE, true, portMAX_DELAY);
+		//bluetooth scan happened. check unordered map bdaName_map
+		for (auto it = bdaName_map.begin(); it != bdaName_map.end(); it++)
+		{
+			// it->first is the bda key
+			// it->second is the bda name
+			deviceReport += it->first + ':' + it->second + '\n';
+		}
+		if (!(deviceReport == "a"))
+		{
+			deviceReport += "!\n";
+			try
+			{
+				client.createSocket(EZPANDA_IP, "5678");
+				client.sendData(deviceReport);
+				string response = client.recvData();
+				cout <<"###|" <<response <<endl;
+				client.closeClientSocket();
+			}catch (SocketException &e)
+			{
+				cout <<e.what() << e.getMsg() <<endl;
+			}
+
+		}
+		//clear map
+		bdaName_map.clear();
+	}
+	////server-side code
+    //
+    //try
+    //{
+    //     Server server("9865");
+    //     server.createSocket();
+    //     while (true)
+    //     {
+    //          string request = server.wait4ClientRequest();
+    //          string response = "You said :" + request;
+    //          server.sendData(response);
+    //          server.closeClientSocket();
+    //     }
+    //}catch (SocketException &e)
+    //{
+    //     cout <<e.what() << e.getMsg();
+    //}
+    //
+    ////client-side code
+    //while(1)
+    //{
+    //     try
+    //     {
+    //          Client client;
+    //          client.createSocket(EZPANDA_IP, "5678");
+    //          vTaskDelay(1500 / portTICK_PERIOD_MS);
+    //          client.sendData("Light1:1\nLight2:0\nServo:1\nEnergyTransmitter:0!\n");
+    //          string response = client.recvData();
+    //          cout <<"###|" <<response <<endl;
+    //          client.closeClientSocket();
+    //     }catch (SocketException &e)
+    //     {
+    //          cout <<e.what() << e.getMsg() <<endl;
+    //     }
+
+    //     vTaskDelay(25000 / portTICK_PERIOD_MS);
+    //}
+
+    /* wait for the server thread to finish */
+    if(pthread_join(server_thread, NULL)) {
+         printf("###|COULD NOT join server thread.\n");
+         esp_restart();
+    }
 }
