@@ -37,6 +37,8 @@ extern "C" {
 	#include "esp_types.h"
 	#include "soc/timer_group_struct.h"
 	#include "driver/periph_ctrl.h"
+	#include "driver/uart.h"
+	#include "soc/uart_struct.h"
 
 	#include <lwip/sockets.h>
 	#include <lwip/netdb.h> //e.g. freeaddrinfo() ...
@@ -46,6 +48,8 @@ extern "C" {
 	#include "esp_bt_main.h"
 	#include "esp_bt_device.h"
 	#include "esp_gap_bt_api.h"
+
+	#include "string.h"
 
 	#include <pthread.h>
 //     void IRAM_ATTR timerHandler(void *para);
@@ -78,6 +82,42 @@ static bool LED_STATE;
 #define CONNECTED_BIT 	(1 << 0) //when this bit is set, esp32 is connected to a wifi LAN network
 #define BLUETOOTH_SCAN_BIT 	(1 << 1) //when this bit is set, esp32 has finished a bluetooth scan
 
+
+#define TXD_PIN (GPIO_NUM_32)
+#define RXD_PIN (GPIO_NUM_33)
+#define QUEUE_TAG "QUEUE TAG"
+//I am using UART1
+static const int RX_BUF_SIZE = sizeof(char)*100;
+
+//---freeRTOS Queue---//
+QueueHandle_t uart_send_queue;
+#define QUEUE_LENGTH 10
+#define QUEUE_ITEM_SIZE sizeof(char)*100 //every message will have 100 chars maximum
+//I am not useing a xQueue for receiving events, since I already got a RING BUFFER
+// big enough to tolerate any delay.
+
+pthread_mutex_t lockSocket; //to lock between bluetooth_send (main thread) & info_send (rx_thread)
+
+//sensor data
+//declaring variables
+int ledsState[7];
+/*
+ * 0 --> Led Group Up
+ * 1 --> Led Group Down
+ * 2 --> Led Red
+ * 3 --> Led Green
+ * 4 --> RGB Led RED 
+ * 5 --> RGB Led GREEN 
+ * 6 --> RGB Led BLUE 
+ */
+float measurements[4];
+/*
+ * 0 --> temperature
+ * 1 --> moisture
+ * 2 --> Luminocity
+ * 3 --> Distance
+ */
+bool doorState;
 
 static EventGroupHandle_t xEventBits; //to handle and sychronize wifi events
 
@@ -327,6 +367,8 @@ void Client::createSocket(string serverName, string service)
      freeaddrinfo(server_info); // all done with this structure
 }
 
+
+Client servableClient; //is accessed by many sections
 
 //-------------------------------- TIMER --------------------------------//
 void IRAM_ATTR timerHandler(void *para)
@@ -651,51 +693,206 @@ static void bt_app_gap_start_up(void *arg) //bluetooth TASK
 }
 
 
+//-------------------------------- UART with arduino --------------------------------//
+int sendDataUART(const char* logName, const char* data)
+{
+    const int len = strlen(data);
+    const int txBytes = uart_write_bytes(UART_NUM_1, data, len);
+    ESP_LOGI(logName, "Wrote %d bytes : %s", txBytes, data);
+    return txBytes;
+}
+
+static void tx_task(void *arg)
+{
+	printf("uart_tx_task task's priority : %d \n", (uxTaskPriorityGet(NULL)));
+    static const char *TX_TASK_TAG = "TX_TASK";
+    esp_log_level_set(TX_TASK_TAG, ESP_LOG_INFO);
+
+	char msg2Arduino[QUEUE_ITEM_SIZE/100];
+    while (1) //check if esp must send something
+	{
+		if (xQueueReceive( uart_send_queue, &msg2Arduino, portMAX_DELAY) != pdPASS)
+		{
+			ESP_LOGI(TX_TASK_TAG, "Nothing was received from the Queue (even after blocking)");
+		}
+		else
+		{
+			sendDataUART(TX_TASK_TAG, msg2Arduino);
+		}
+		memset(&msg2Arduino, 0, sizeof(msg2Arduino));
+    }
+}
+
+void *rx_thread(void *args)
+{
+    static const char *RX_TASK_TAG = "RX_TASK";
+    esp_log_level_set(RX_TASK_TAG, ESP_LOG_INFO);
+    uint8_t* data = (uint8_t*) malloc(RX_BUF_SIZE+1);
+    std::string send2Server;
+    const char delim[2] = "\n";
+    char *token, *charInfo, *red, *green, *blue;
+    int lastExclamationPosition;
+    Client infoClient;
+    while (true) 
+    {	//RX_BUF_SIZE-1 , so that I can add a \n\0 if needed
+        const int rxBytes = uart_read_bytes(UART_NUM_1, data, RX_BUF_SIZE-2, 1000 / portTICK_RATE_MS);
+        if (rxBytes > 0) 
+    	{
+          data[rxBytes] = 0;
+          ESP_LOGI(RX_TASK_TAG, "Read %d bytes: \n'%s'\n end of message\n", rxBytes, data);
+          //ESP_LOG_BUFFER_HEXDUMP(RX_TASK_TAG, data, rxBytes, ESP_LOG_INFO);
+    	
+    		//process response
+    		send2Server = "<";
+
+    		charInfo = reinterpret_cast<char *>(data);
+    		
+    		if (rxBytes == RX_BUF_SIZE-2) //overflow. cut the response
+    		{
+    			lastExclamationPosition = strrchr(charInfo, '!') - charInfo;
+    			charInfo[lastExclamationPosition + 1] = '\n'; 
+    			charInfo[lastExclamationPosition + 2] = '\0'; 
+    		}
+
+    		send2Server = send2Server + std::string(charInfo);
+    		if (send2Server.find("-") != std::string::npos)
+    		{
+				printf("###|IF it is\n");
+    			//send it quickly
+    			try
+    			{
+    				servableClient.sendData(send2Server);
+    			}catch (SocketException &e)
+    			{
+    				cout <<e.what() << e.getMsg() <<endl;
+    			}
+
+    		}else
+    		{
+				printf("###|ELSE it is\n");
+
+    			//parse the string
+
+    			token = strtok(charInfo, delim);
+
+    			while(token != NULL)
+    			{
+    				switch (token[0])
+    				{
+    					case '0':
+    					case '1':
+    					case '2':
+    					case '3':
+    						ledsState[atoi(token)] = atoi(token + 2);
+    						break;
+    					case '4':
+    						//look for ':' & next is red
+    						red = strchr(token, ':');
+    						ledsState[4] = atoi(red+1);
+
+    						green = strchr(red, ',');
+    						ledsState[5] = atoi(green+1);
+
+    						blue = strchr(green+1, ',');
+    						ledsState[6] = atoi(blue+1);
+
+    						break;
+    					case '5':
+    						measurements[0] = atof(token + 2);
+    						break;
+    					case '6':
+    						measurements[1] = atof(token + 2);
+    						break;
+    					case '7':
+    						measurements[2] = atof(token + 2);
+    						break;
+    					case '8':
+    						measurements[3] = atof(token + 2);
+    						break;
+    					case '9':
+    						doorState = atoi(token+2);
+    						break;
+    					case '!': //end of message //MUST PUT A MUTEX HERE
+    						//send initiatting data
+    						pthread_mutex_lock(&lockSocket);
+    						try
+    						{
+    							infoClient.createSocket(EZPANDA_IP, "5678");
+    							vTaskDelay(1500 / portTICK_PERIOD_MS);
+    							infoClient.sendData(send2Server);
+    							string response = infoClient.recvData();
+    							cout <<"###|" <<response <<endl;
+    							infoClient.closeClientSocket();
+    						}catch (SocketException &e)
+    						{
+    							cout <<e.what() << e.getMsg() <<endl;
+    						}
+    						pthread_mutex_unlock(&lockSocket);
+    						break;
+    				}
+    				token = strtok(NULL,delim); //exclusive on delimiter
+    			}
+    		
+    		}
+    	}
+    }
+   	free(data);
+}
+
 
 //-------------------------------- SERVER THREAD --------------------------------//
 void *servering(void *args)//this function is run by the server thread
 {
+	cout <<"###|Starting servering thread\n";
+	string command, response="esp here reee !\n";
+
+	////tdlt
+	//bool APACHE_LED_STATE = 0;
+	//gpio_set_direction(GPIO_APACHE_LED, GPIO_MODE_OUTPUT);
+	//gpio_set_level(GPIO_APACHE_LED, APACHE_LED_STATE);
+	try
+	{
+		servableClient.createSocket(EZPANDA_IP, "4567");
+
+		const char *msg2Arduino;
+		while(1)
+		{
+			command = "";
+			response = "";
+			command = servableClient.recvData();
+			cout <<"###|apache command :" <<command <<endl;
+
+			////proccess command
+			if (command.at(0) == '<') //arduino command
+			{
+				command = command.substr(1); //strip off '<'
+				msg2Arduino = command.c_str();
+				xQueueSendToBack(uart_send_queue, msg2Arduino, portMAX_DELAY);
+				// the request will be handled by tx_task & rx_thread
+			}else if (command.at(0) == '&')//polling me
+			{ 
+				response = "yes!\n";
+				servableClient.sendData(response);
+				//cout <<"###|apache response :" <<response <<endl;
+			}
 
 
-     cout <<"###|Starting servering thread\n";
-     string command, response="esp here reee !\n";
+			//command = command.substr (0,command.length()-5);
+			//if (command.at(0) == '?')
+			//{
+			//     APACHE_LED_STATE = !APACHE_LED_STATE;
+			//     gpio_set_level(GPIO_APACHE_LED, APACHE_LED_STATE);
+			//}
 
-     //tdlt
-     bool APACHE_LED_STATE = 0;
-     gpio_set_direction(GPIO_APACHE_LED, GPIO_MODE_OUTPUT);
-     gpio_set_level(GPIO_APACHE_LED, APACHE_LED_STATE);
-     try
-     {
-          Client servableClient;
-          servableClient.createSocket(EZPANDA_IP, "4567");
 
-          while(1)
-          {
-               command = "";
-               response = "";
-               command = servableClient.recvData();
-               cout <<"###|apache command :" <<command <<endl;
-
-               //proccess command
-               command = command.substr (0,command.length()-5);
-               if (command.at(0) == '?')
-               {
-                    APACHE_LED_STATE = !APACHE_LED_STATE;
-                    gpio_set_level(GPIO_APACHE_LED, APACHE_LED_STATE);
-               }
-
-               response = "ESP:" + command + "!\n";
-               servableClient.sendData(response);
-               cout <<"###|apache response :" <<response <<endl;
-
-               //vTaskDelay(1000 / portTICK_PERIOD_MS);
-          }
-          servableClient.closeClientSocket();
-     }catch (SocketException &e)
-     {
-          cout <<e.what() << e.getMsg() <<endl;
-     }
-     return NULL;
+			//vTaskDelay(1000 / portTICK_PERIOD_MS);
+		}
+		servableClient.closeClientSocket();
+	}catch (SocketException &e)
+	{
+		cout <<e.what() << e.getMsg() <<endl;
+	}
+	return NULL;
 }
 
 void app_main()
@@ -757,6 +954,25 @@ void app_main()
 	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
 	ESP_ERROR_CHECK(esp_wifi_start()); //start wifi, according to current configuration
 	ESP_ERROR_CHECK(esp_wifi_scan_start(&scanConf, 0)); //blocking (true) or non blocking (false) mode by the second parameter
+	
+	//----initialize UART-----//
+	uart_config_t uart_config = {};
+	uart_config.baud_rate = 115200;
+	uart_config.data_bits = UART_DATA_8_BITS;
+	uart_config.parity = UART_PARITY_DISABLE;
+	uart_config.stop_bits = UART_STOP_BITS_1;
+	uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    uart_param_config(UART_NUM_1, &uart_config);
+
+    uart_set_pin(UART_NUM_1, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    //@arg 3 : I am not using a buffer for sending data.
+	// So, TX function will block task untill all data have been sent out.
+    uart_driver_install(UART_NUM_1, RX_BUF_SIZE * 10, 0, 0, NULL, 0);
+
+	//-----initialize freeRTOS Queue and the attending tasks-----//
+	if ((uart_send_queue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE)) == NULL)
+		ESP_LOGE(QUEUE_TAG, "freeRTOS Queue could not be created");
 
 	//--------------------------Bluetooth configuration---------------------------//
 	esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
@@ -783,6 +999,8 @@ void app_main()
 	//wait indefinetely untill esp32 gets connected
 	xEventGroupWaitBits(xEventBits, CONNECTED_BIT, false, true, portMAX_DELAY);
 
+	printf("###|main task's priority : %d \n", (uxTaskPriorityGet(NULL)));
+
 	//----------------------------INTERNET !---------------------------------//
 	tcpip_adapter_ip_info_t ip_info;
 	ESP_ERROR_CHECK(tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip_info));
@@ -790,23 +1008,11 @@ void app_main()
 	printf("###|esp32 : Subnet Mask : %s\n", ip4addr_ntoa(&ip_info.netmask));
 	printf("###|esp32 : Gateway     : %s\n", ip4addr_ntoa(&ip_info.gw));
 	
-	Client client;
-	//send initiatting data
-	try
-	{
-		client.createSocket(EZPANDA_IP, "5678");
-		vTaskDelay(1500 / portTICK_PERIOD_MS);
-		client.sendData("<Light1:1\nLight2:0\nServo:1\nEnergyTransmitter:0\n!\n"); //e.g.
-		string response = client.recvData();
-		cout <<"###|" <<response <<endl;
-		client.closeClientSocket();
-	}catch (SocketException &e)
-	{
-		cout <<e.what() << e.getMsg() <<endl;
-	}
 	
 	
-
+	
+	//start TX uart task
+    xTaskCreate(tx_task, "uart_tx_task", 1024*2, NULL, configMAX_PRIORITIES-1, NULL);
 	//start bluetooth task
 	xTaskCreate(bt_app_gap_start_up, "connected_to_wifi_program", 2048, NULL, 5, NULL);
 
@@ -814,7 +1020,25 @@ void app_main()
     pthread_t server_thread;
     if (pthread_create(&server_thread, NULL, servering, NULL))
          printf("###|COULD NOT start server thread.\n");
+	//creating pthread for rx uart (not a task because socket exceptions are needed)
+	//first intilialize the mutex between the thread & the main thread
+
+	if (pthread_mutex_init(&lockSocket, NULL) != 0)
+		ESP_LOGE(USER_TAG, "Could not initialize mutex");
+    pthread_t rxUART_thread;
+    if (pthread_create(&rxUART_thread, NULL, rx_thread, NULL))
+         printf("###|COULD NOT start server thread.\n");
 	
+
+    
+	//initialize data
+	//ask for full report
+	const char *msg2Arduino = "*!\n";
+	//std::string str = "*!\n";
+	//queue_msg2Arduino = str.c_str();
+	xQueueSendToBack(uart_send_queue, msg2Arduino, portMAX_DELAY);
+
+	Client client;
 	while (true)
 	{
 		string deviceReport = "@";
@@ -830,6 +1054,7 @@ void app_main()
 		if (!(deviceReport == "a"))
 		{
 			deviceReport += "!\n";
+			pthread_mutex_lock(&lockSocket);
 			try
 			{
 				client.createSocket(EZPANDA_IP, "5678");
@@ -841,10 +1066,12 @@ void app_main()
 			{
 				cout <<e.what() << e.getMsg() <<endl;
 			}
+			pthread_mutex_unlock(&lockSocket);
 
 		}
 		//clear map
 		bdaName_map.clear();
+        vTaskDelay(10 / portTICK_PERIOD_MS);
 	}
 	////server-side code
     //
@@ -889,4 +1116,9 @@ void app_main()
          printf("###|COULD NOT join server thread.\n");
          esp_restart();
     }
+    if(pthread_join(rxUART_thread, NULL)) {
+         printf("###|COULD NOT join rxUART thread.\n");
+         esp_restart();
+    }
+	pthread_mutex_destroy(&lockSocket);
 }
