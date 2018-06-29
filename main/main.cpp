@@ -65,7 +65,7 @@ extern "C" {
 
 #define GPIO_BLINKY_LED GPIO_NUM_5
 #define GPIO_APACHE_LED GPIO_NUM_4
-static bool LED_STATE;
+//static bool LED_STATE;
 
 #define WIFI_SSID CONFIG_ESP_SSID_toConnect
 #define WIFI_PASSWORD CONFIG_ESP_WIFI_PASSWORD
@@ -373,49 +373,50 @@ void Client::createSocket(string serverName, string service)
 Client servableClient; //is accessed by many sections
 Client streamClient; //is accessed by many sections
 
-//-------------------------------- TIMER --------------------------------//
-void IRAM_ATTR timerHandler(void *para)
-{
-     int timer_idx = (int) para;
-
-     //uint32_t intr_status = TIMERG0.int_st_timers.val; //retrieve interrupt status
-     TIMERG0.hw_timer[timer_idx].update = 1;
-
-     //Clear the interrupt & Update the alarm time for the timer which has auro_reload cleared
-     //we use reload so :
-     TIMERG0.int_clr_timers.t0 = 1;
-
-     //We must enable again the alarm, if we want to get triggered again.
-     TIMERG0.hw_timer[timer_idx].config.alarm_en = TIMER_ALARM_EN;
-     //printf("Invert led !\n" );
-     LED_STATE = !LED_STATE;
-     gpio_set_level(GPIO_BLINKY_LED, LED_STATE);
-}
-
-
-static void tg0_timer_init(timer_idx_t timer_idx, bool auto_reload, double timer_interval_sec)
-{
-     //initialize basic parameters of the timer_idx
-     timer_config_t config; //data structure with timer's configuration settings
-     config.divider = TIMER_DIVIDER; //the divider's range is from 2 to 65536
-     config.counter_dir = TIMER_COUNT_UP;
-     config.counter_en = TIMER_PAUSE; //don't start counting
-     config.alarm_en = TIMER_ALARM_EN; //enable alarm
-     config.intr_type = TIMER_INTR_LEVEL; //alarm will be level based (no max-enabled) //MAYBE ERROR
-     config.auto_reload = auto_reload; //when alarm happens, what will the counter become?
-     timer_init(TIMER_GROUP_0, timer_idx, &config);
-
-     // Timer's counter will initially start from value below.
-     // Also, if auto_reload is set, this value will be automatically reload on alarm
-     timer_set_counter_value(TIMER_GROUP_0, timer_idx, 0x00000000ULL); //Unsigned Long Long
-
-     timer_set_alarm_value(TIMER_GROUP_0, timer_idx, timer_interval_sec*TIMER_SCALE); //set the level of the alarm
-     timer_enable_intr(TIMER_GROUP_0, timer_idx);
-     timer_isr_register(TIMER_GROUP_0, timer_idx, timerHandler, (void *)timer_idx,
-          ESP_INTR_FLAG_IRAM, NULL); //maybe modify this ?
-
-     timer_start(TIMER_GROUP_0, timer_idx);
-}
+////-------------------------------- TIMER --------------------------------//
+//void IRAM_ATTR timerHandler(void *para)
+//{
+//     int timer_idx = (int) para;
+//
+//     //uint32_t intr_status = TIMERG0.int_st_timers.val; //retrieve interrupt status
+//     TIMERG0.hw_timer[timer_idx].update = 1;
+//
+//     //Clear the interrupt & Update the alarm time for the timer which has auro_reload cleared
+//     //we use reload so :
+//     TIMERG0.int_clr_timers.t0 = 1;
+//
+//     //We must enable again the alarm, if we want to get triggered again.
+//     TIMERG0.hw_timer[timer_idx].config.alarm_en = TIMER_ALARM_EN;
+//     //printf("Invert led !\n" );
+//     LED_STATE = !LED_STATE;
+//     gpio_set_level(GPIO_BLINKY_LED, LED_STATE);
+//}
+//
+//
+//static void tg0_timer_init(timer_idx_t timer_idx, bool auto_reload, double timer_interval_sec)
+//{
+//     //initialize basic parameters of the timer_idx
+//     timer_config_t config; //data structure with timer's configuration settings
+//     config.divider = TIMER_DIVIDER; //the divider's range is from 2 to 65536
+//     config.counter_dir = TIMER_COUNT_UP;
+//     config.counter_en = TIMER_PAUSE; //don't start counting
+//     config.alarm_en = TIMER_ALARM_EN; //enable alarm
+//     config.intr_type = TIMER_INTR_LEVEL; //alarm will be level based (no max-enabled) //MAYBE ERROR
+//     config.auto_reload = auto_reload; //when alarm happens, what will the counter become?
+//     timer_init(TIMER_GROUP_0, timer_idx, &config);
+//
+//     // Timer's counter will initially start from value below.
+//     // Also, if auto_reload is set, this value will be automatically reload on alarm
+//     timer_set_counter_value(TIMER_GROUP_0, timer_idx, 0x00000000ULL); //Unsigned Long Long
+//
+//     timer_set_alarm_value(TIMER_GROUP_0, timer_idx, timer_interval_sec*TIMER_SCALE); //set the level of the alarm
+//     timer_enable_intr(TIMER_GROUP_0, timer_idx);
+//     timer_isr_register(TIMER_GROUP_0, timer_idx, timerHandler, (void *)timer_idx,
+//          ESP_INTR_FLAG_IRAM, NULL); //maybe modify this ?
+//
+//     timer_start(TIMER_GROUP_0, timer_idx);
+//}
+//
 
 //-------------------------------- WIFI --------------------------------//
 esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
@@ -1005,11 +1006,13 @@ void app_main()
 	printf("                    ╲╲╲╲▕▏◤┈▼┈◥▕▏╱╱╱╱\n");
 	printf("                    ╲╲╲╲▕▏╲╰━╯╱▕▏╱╱╱╱\n");
 	printf("#########################################################\n");
-	//make a blinky !
-	gpio_set_direction(GPIO_BLINKY_LED, GPIO_MODE_OUTPUT);
-	LED_STATE = 0;
-	gpio_set_level(GPIO_BLINKY_LED, LED_STATE);
-	tg0_timer_init(TIMER_0, TEST_WITH_RELOAD, TIMER_LED);
+
+	////make a blinky !
+	//gpio_set_direction(GPIO_BLINKY_LED, GPIO_MODE_OUTPUT);
+	//LED_STATE = 0;
+	//gpio_set_level(GPIO_BLINKY_LED, LED_STATE);
+	//tg0_timer_init(TIMER_0, TEST_WITH_RELOAD, TIMER_LED);
+
 	//   3)given that we have an architecture of 4 byte stack width (one word),
 	// the xTaskCreate reserves 2048*4 = 8072bytes = 8kB
 	//   5)Priorities can be assigned
@@ -1109,21 +1112,23 @@ void app_main()
 	
 	
 	
-	//start TX uart task
+	// Start TX uart task
     xTaskCreate(tx_task, "uart_tx_task", 1024*2, NULL, configMAX_PRIORITIES-1, NULL);
-	//start bluetooth task
+	// Start bluetooth task
 	xTaskCreate(bt_app_gap_start_up, "connected_to_wifi_program", 2048, NULL, 5, NULL);
 
-    //creating pthread for server 
+    // Creating pthread for server 
     pthread_t server_thread;
     if (pthread_create(&server_thread, NULL, servering, NULL))
          printf("###|COULD NOT start server thread.\n");
-	//creating pthread for rx uart (not a task because socket exceptions are needed)
-	//first intilialize the mutex between the thread & the main thread
 
+	// First intilialize the mutex between the thread & the main thread.
+	// A socket is shared between rxUART_thread & main thread. 
+	//   so, I need a mutex, so that they don't access it at the same time
 	if (pthread_mutex_init(&lockSocket, NULL) != 0)
 		ESP_LOGE(USER_TAG, "Could not initialize mutex");
     pthread_t rxUART_thread;
+	//creating pthread for rx uart (not a task because socket exceptions are needed)
     if (pthread_create(&rxUART_thread, NULL, rx_thread, NULL))
         printf("###|COULD NOT start server thread.\n");
 	
