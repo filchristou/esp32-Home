@@ -119,6 +119,8 @@ float measurements[4];
  */
 bool doorState;
 
+bool wattStreamEnabled = false, spaceStreamEnabled = false ;
+
 static EventGroupHandle_t xEventBits; //to handle and sychronize wifi events
 
 //the Exception
@@ -176,7 +178,7 @@ class Connection
           void closeClientSocket() { close(socket_comm); }
           void sendData(string response) //send
           {
-               if (send(socket_comm, response.c_str(), response.length()+1, 0) == -1)
+               if (send(socket_comm, response.c_str(), response.length(), 0) == -1)
                {
                     SocketException e(socket_comm, "send() error");
                     throw e;
@@ -369,6 +371,7 @@ void Client::createSocket(string serverName, string service)
 
 
 Client servableClient; //is accessed by many sections
+Client streamClient; //is accessed by many sections
 
 //-------------------------------- TIMER --------------------------------//
 void IRAM_ATTR timerHandler(void *para)
@@ -732,7 +735,8 @@ void *rx_thread(void *args)
     const char delim[2] = "\n";
     char *token, *charInfo, *red, *green, *blue;
     int lastExclamationPosition;
-    Client infoClient;
+
+
     while (true) 
     {	//RX_BUF_SIZE-1 , so that I can add a \n\0 if needed
         const int rxBytes = uart_read_bytes(UART_NUM_1, data, RX_BUF_SIZE-2, 1000 / portTICK_RATE_MS);
@@ -746,94 +750,183 @@ void *rx_thread(void *args)
     		send2Server = "<";
 
     		charInfo = reinterpret_cast<char *>(data);
-    		
+    				
     		if (rxBytes == RX_BUF_SIZE-2) //overflow. cut the response
     		{
-    			lastExclamationPosition = strrchr(charInfo, '!') - charInfo;
-    			charInfo[lastExclamationPosition + 1] = '\n'; 
-    			charInfo[lastExclamationPosition + 2] = '\0'; 
+				const char* temp = strrchr(charInfo, '!');
+				if (temp != NULL)
+				{
+					lastExclamationPosition = temp - charInfo;
+					charInfo[lastExclamationPosition + 1] = '\n'; 
+					charInfo[lastExclamationPosition + 2] = '\0'; 
+				}
     		}
 
-    		send2Server = send2Server + std::string(charInfo);
-    		if (send2Server.find("-") != std::string::npos)
-    		{
-				printf("###|IF it is\n");
-    			//send it quickly
-    			try
-    			{
-    				servableClient.sendData(send2Server);
-    			}catch (SocketException &e)
-    			{
-    				cout <<e.what() << e.getMsg() <<endl;
-    			}
-
-    		}else
-    		{
-				printf("###|ELSE it is\n");
-
-    			//parse the string
-
-    			token = strtok(charInfo, delim);
-
-    			while(token != NULL)
-    			{
-    				switch (token[0])
-    				{
-    					case '0':
-    					case '1':
-    					case '2':
-    					case '3':
-    						ledsState[atoi(token)] = atoi(token + 2);
-    						break;
-    					case '4':
-    						//look for ':' & next is red
-    						red = strchr(token, ':');
-    						ledsState[4] = atoi(red+1);
-
-    						green = strchr(red, ',');
-    						ledsState[5] = atoi(green+1);
-
-    						blue = strchr(green+1, ',');
-    						ledsState[6] = atoi(blue+1);
-
-    						break;
-    					case '5':
-    						measurements[0] = atof(token + 2);
-    						break;
-    					case '6':
-    						measurements[1] = atof(token + 2);
-    						break;
-    					case '7':
-    						measurements[2] = atof(token + 2);
-    						break;
-    					case '8':
-    						measurements[3] = atof(token + 2);
-    						break;
-    					case '9':
-    						doorState = atoi(token+2);
-    						break;
-    					case '!': //end of message //MUST PUT A MUTEX HERE
-    						//send initiatting data
-    						pthread_mutex_lock(&lockSocket);
-    						try
-    						{
-    							infoClient.createSocket(EZPANDA_IP, "5678");
-    							vTaskDelay(1500 / portTICK_PERIOD_MS);
-    							infoClient.sendData(send2Server);
-    							string response = infoClient.recvData();
-    							cout <<"###|" <<response <<endl;
-    							infoClient.closeClientSocket();
-    						}catch (SocketException &e)
-    						{
-    							cout <<e.what() << e.getMsg() <<endl;
-    						}
-    						pthread_mutex_unlock(&lockSocket);
-    						break;
-    				}
-    				token = strtok(NULL,delim); //exclusive on delimiter
-    			}
+    		//send2Server = send2Server + std::string(charInfo);
     		
-    		}
+			//parse the string , save data and send it
+
+			token = strtok(charInfo, delim);
+			
+			send2Server = "<";
+			while(token != NULL)
+			{
+				switch (token[0])
+				{
+					case '0':
+					case '1':
+					case '2':
+					case '3':
+						ledsState[atoi(token)] = atoi(token + 2);
+						send2Server = send2Server + token + '\n';
+						break;
+					case '4':
+						//look for ':' & next is red
+						red = strchr(token, ':');
+						ledsState[4] = atoi(red+1);
+
+						green = strchr(red, ',');
+						ledsState[5] = atoi(green+1);
+
+						blue = strchr(green+1, ',');
+						ledsState[6] = atoi(blue+1);
+
+						send2Server = send2Server + token + '\n';
+						break;
+					case '5':
+						measurements[0] = atof(token + 2);
+						send2Server = send2Server + token + '\n';
+						break;
+					case '6':
+						measurements[1] = atof(token + 2);
+						send2Server = send2Server + token + '\n';
+						break;
+					case '7':
+						measurements[2] = atof(token + 2);
+						send2Server = send2Server + token + '\n';
+						break;
+					case '8':
+						if (*(token + 2) == 'E')
+						{
+							if (wattStreamEnabled == false && spaceStreamEnabled == false) //stream socket must be enabled once
+							{
+								try
+								{
+									streamClient.createSocket(EZPANDA_IP, "5555");
+								}catch (SocketException &e)
+								{
+									cout <<"Error in streamClient upon receipt of '8:E'." <<e.what() << e.getMsg() <<endl;
+								}
+							}
+							spaceStreamEnabled = true;
+						}else if (*(token + 2) == 'D')
+						{
+							if (spaceStreamEnabled == true && wattStreamEnabled == false) // must not RE-close socket
+							{
+								try
+								{
+									streamClient.closeClientSocket();
+								}catch (SocketException &e)
+								{
+									cout  <<"Error in streamClient upon receipt of '8:E'." <<e.what() << e.getMsg() <<endl;
+								}
+							}
+							spaceStreamEnabled = false;
+						}else
+							measurements[3] = atof(token + 2);
+						send2Server = send2Server + token + '\n';
+						break;
+					case '9':
+						doorState = atoi(token+2);
+						send2Server = send2Server + token + '\n';
+						break;
+					case 'W':
+						if (*(token + 2) == 'E')
+						{
+							if (spaceStreamEnabled == false && wattStreamEnabled == false) //stream socket must be enabled once
+							{
+								try
+								{
+									streamClient.createSocket(EZPANDA_IP, "5555");
+								}catch (SocketException &e)
+								{
+									cout <<e.what() << e.getMsg() <<endl;
+								}
+							}
+							wattStreamEnabled = true;
+						}else if (*(token + 2) == 'D')
+						{
+							if (wattStreamEnabled == true && spaceStreamEnabled == false) // must not RE-close socket
+							{
+								try
+								{
+									streamClient.closeClientSocket();
+								}catch (SocketException &e)
+								{
+									cout <<e.what() << e.getMsg() <<endl;
+								}
+							}
+							wattStreamEnabled = false;
+						}
+						send2Server = send2Server + token + '\n';
+						break;
+					case '!': //end of message //MUST PUT A MUTEX HERE
+						//send initiatting data
+						send2Server = send2Server + '!' + '\n';
+						//cout <<"###|Sending (!) :" <<send2Server;
+						pthread_mutex_lock(&lockSocket);
+						try
+						{
+							Client infoClient;
+							infoClient.createSocket(EZPANDA_IP, "5678");
+							//vTaskDelay(1500 / portTICK_PERIOD_MS);
+							infoClient.sendData(send2Server);
+							infoClient.closeClientSocket();
+						}catch (SocketException &e)
+						{
+							cout <<e.what() << e.getMsg() <<endl;
+						}
+						pthread_mutex_unlock(&lockSocket);
+						send2Server = "<";
+						break;
+					case '-':
+						send2Server = send2Server + '-' + '!' + '\n';
+						//cout <<"###|Sending (-) :" <<send2Server;
+						try
+						{
+							servableClient.sendData(send2Server);
+						}catch (SocketException &e)
+						{
+							cout <<e.what() << e.getMsg() <<endl;
+						}
+						send2Server = "<";
+						break;
+					case '$':
+						send2Server = send2Server + '$' + '!' + '\n';
+						//cout <<"###|Sending ($) :" <<send2Server;
+						//send it quickly if stream is enabled (for some time there will be packets that I must not send because of latency)
+						if (wattStreamEnabled == true || spaceStreamEnabled == true)
+						{
+							try
+							{
+								streamClient.sendData(send2Server);
+							}catch (SocketException &e)
+							{
+								//cannot send data. explicitely close stream (and implicitely the stream socket)
+								//const char *msg2Arduino = "8:D\nW:D\n!\n"; //disable streams
+								//xQueueSendToBack(uart_send_queue, "8:D\nW:D\n!\n", portMAX_DELAY);
+								cout <<e.what() << e.getMsg() <<endl;
+							}
+						}
+						send2Server = "<";
+						break;
+					default:
+						break;
+				}
+				token = strtok(NULL,delim); //exclusive on delimiter
+			}
+		
+    		
     	}
     }
    	free(data);
@@ -845,53 +938,58 @@ void *servering(void *args)//this function is run by the server thread
 {
 	cout <<"###|Starting servering thread\n";
 	string command, response="esp here reee !\n";
-
 	////tdlt
 	//bool APACHE_LED_STATE = 0;
 	//gpio_set_direction(GPIO_APACHE_LED, GPIO_MODE_OUTPUT);
 	//gpio_set_level(GPIO_APACHE_LED, APACHE_LED_STATE);
-	try
-	{
-		servableClient.createSocket(EZPANDA_IP, "4567");
+	
+	servableClient.createSocket(EZPANDA_IP, "4567");
 
-		const char *msg2Arduino;
-		while(1)
-		{
+	const char *msg2Arduino;
+	while(1)
+	{
+		try
+		{	
 			command = "";
 			response = "";
+
+			cout <<"###|backwards read...\n" ;
 			command = servableClient.recvData();
+		
 			cout <<"###|apache command :" <<command <<endl;
-
-			////proccess command
-			if (command.at(0) == '<') //arduino command
+			
+			if (command.length() > 1) //sometimes it just reads crap
 			{
-				command = command.substr(1); //strip off '<'
-				msg2Arduino = command.c_str();
-				xQueueSendToBack(uart_send_queue, msg2Arduino, portMAX_DELAY);
-				// the request will be handled by tx_task & rx_thread
-			}else if (command.at(0) == '&')//polling me
-			{ 
-				response = "yes!\n";
-				servableClient.sendData(response);
-				//cout <<"###|apache response :" <<response <<endl;
+				////proccess command
+				if (command.at(0) == '<') //arduino command
+				{
+					command = command.substr(1); //strip off '<'
+					msg2Arduino = command.c_str();
+					xQueueSendToBack(uart_send_queue, msg2Arduino, portMAX_DELAY);
+					// the request will be handled by tx_task & rx_thread
+				}else if (command.at(0) == '&')//polling me
+				{ 
+					response = "yes!\n";
+					servableClient.sendData(response);
+					//cout <<"###|apache response :" <<response <<endl;
+				}
+
+				//command = command.substr (0,command.length()-5);
+				//if (command.at(0) == '?')
+				//{
+				//     APACHE_LED_STATE = !APACHE_LED_STATE;
+				//     gpio_set_level(GPIO_APACHE_LED, APACHE_LED_STATE);
+				//}
 			}
-
-
-			//command = command.substr (0,command.length()-5);
-			//if (command.at(0) == '?')
-			//{
-			//     APACHE_LED_STATE = !APACHE_LED_STATE;
-			//     gpio_set_level(GPIO_APACHE_LED, APACHE_LED_STATE);
-			//}
-
+		}catch (SocketException &e)
+		{
+			cout <<e.what() << e.getMsg() <<endl;
+		}
 
 			//vTaskDelay(1000 / portTICK_PERIOD_MS);
-		}
-		servableClient.closeClientSocket();
-	}catch (SocketException &e)
-	{
-		cout <<e.what() << e.getMsg() <<endl;
 	}
+	servableClient.closeClientSocket();
+	
 	return NULL;
 }
 
@@ -1027,16 +1125,16 @@ void app_main()
 		ESP_LOGE(USER_TAG, "Could not initialize mutex");
     pthread_t rxUART_thread;
     if (pthread_create(&rxUART_thread, NULL, rx_thread, NULL))
-         printf("###|COULD NOT start server thread.\n");
+        printf("###|COULD NOT start server thread.\n");
 	
 
     
 	//initialize data
 	//ask for full report
-	const char *msg2Arduino = "*!\n";
-	//std::string str = "*!\n";
-	//queue_msg2Arduino = str.c_str();
-	xQueueSendToBack(uart_send_queue, msg2Arduino, portMAX_DELAY);
+	//const char *msg2Arduino1 = "*\n!\n";
+	xQueueSendToBack(uart_send_queue, "*\n!\n", portMAX_DELAY);
+	//const char *msg2Arduino2 = "8:D\nW:D\n!\n"; //disable streams
+	xQueueSendToBack(uart_send_queue, "8:D\nW:D\n!\n", portMAX_DELAY);
 
 	Client client;
 	while (true)
@@ -1051,7 +1149,7 @@ void app_main()
 			// it->second is the bda name
 			deviceReport += it->first + ':' + it->second + '\n';
 		}
-		if (!(deviceReport == "a"))
+		if (!(deviceReport == "@"))
 		{
 			deviceReport += "!\n";
 			pthread_mutex_lock(&lockSocket);
@@ -1059,8 +1157,6 @@ void app_main()
 			{
 				client.createSocket(EZPANDA_IP, "5678");
 				client.sendData(deviceReport);
-				string response = client.recvData();
-				cout <<"###|" <<response <<endl;
 				client.closeClientSocket();
 			}catch (SocketException &e)
 			{
