@@ -748,7 +748,7 @@ void *rx_thread(void *args)
           //ESP_LOG_BUFFER_HEXDUMP(RX_TASK_TAG, data, rxBytes, ESP_LOG_INFO);
     	
     		//process response
-    		send2Server = "<";
+    		send2Server = "<Apollo\n";
 
     		charInfo = reinterpret_cast<char *>(data);
     				
@@ -769,7 +769,7 @@ void *rx_thread(void *args)
 
 			token = strtok(charInfo, delim);
 			
-			send2Server = "<";
+			send2Server = "";
 			while(token != NULL)
 			{
 				switch (token[0])
@@ -873,7 +873,7 @@ void *rx_thread(void *args)
 						break;
 					case '!': //end of message //MUST PUT A MUTEX HERE
 						//send initiatting data
-						send2Server = send2Server + '!' + '\n';
+						send2Server = "<Apollo\n" + send2Server + '!' + '\n';
 						//cout <<"###|Sending (!) :" <<send2Server;
 						pthread_mutex_lock(&lockSocket);
 						try
@@ -888,10 +888,10 @@ void *rx_thread(void *args)
 							cout <<e.what() << e.getMsg() <<endl;
 						}
 						pthread_mutex_unlock(&lockSocket);
-						send2Server = "<";
+						send2Server = "";
 						break;
-					case '-':
-						send2Server = send2Server + '-' + '!' + '\n';
+					case '#':
+						send2Server = '<' + send2Server + '#' + '!' + '\n';
 						//cout <<"###|Sending (-) :" <<send2Server;
 						try
 						{
@@ -900,10 +900,10 @@ void *rx_thread(void *args)
 						{
 							cout <<e.what() << e.getMsg() <<endl;
 						}
-						send2Server = "<";
+						send2Server = "";
 						break;
 					case '$':
-						send2Server = send2Server + '$' + '!' + '\n';
+						send2Server = '<' + send2Server + '$' + '!' + '\n';
 						//cout <<"###|Sending ($) :" <<send2Server;
 						//send it quickly if stream is enabled (for some time there will be packets that I must not send because of latency)
 						if (wattStreamEnabled == true || spaceStreamEnabled == true)
@@ -919,7 +919,7 @@ void *rx_thread(void *args)
 								cout <<e.what() << e.getMsg() <<endl;
 							}
 						}
-						send2Server = "<";
+						send2Server = "";
 						break;
 					default:
 						break;
@@ -945,6 +945,8 @@ void *servering(void *args)//this function is run by the server thread
 	//gpio_set_level(GPIO_APACHE_LED, APACHE_LED_STATE);
 	
 	servableClient.createSocket(EZPANDA_IP, "4567");
+	//send my id
+	servableClient.sendData("Apollo\n");
 
 	const char *msg2Arduino;
 	while(1)
@@ -1116,6 +1118,13 @@ void app_main()
     xTaskCreate(tx_task, "uart_tx_task", 1024*2, NULL, configMAX_PRIORITIES-1, NULL);
 	// Start bluetooth task
 	xTaskCreate(bt_app_gap_start_up, "connected_to_wifi_program", 2048, NULL, 5, NULL);
+
+	////pthread attributes
+	//pthread_attr_t attr;
+	//size_t stacksize;
+	//pthread_attr_init(&attr);
+	//pthread_attr_getstacksize(&attr, &stacksize);
+	//printf("Thread stack size = %zd bytes \n", stacksize);
 
     // Creating pthread for server 
     pthread_t server_thread;
