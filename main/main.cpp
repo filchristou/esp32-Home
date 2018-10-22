@@ -474,6 +474,9 @@ esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
           {
                printf("###|Disconnected from wifi\n");
                xEventGroupClearBits(xEventBits, CONNECTED_BIT);
+			   //!!!
+			   fflush(stdout);
+			   esp_restart();
                break;
           }
           default:
@@ -692,7 +695,7 @@ static void bt_app_gap_start_up(void *arg) //bluetooth TASK
 		//signal main task to handle the event : bluetooth devices scanned
 		xEventGroupSetBits(xEventBits, BLUETOOTH_SCAN_BIT);
 
-		vTaskDelay(300000 / portTICK_PERIOD_MS); //wait for 5 minutes before scanning again
+		vTaskDelay(1200000 / portTICK_PERIOD_MS); //wait for 20 minutes before scanning again
 	}
 }
 
@@ -957,6 +960,10 @@ void *servering(void *args)//this function is run by the server thread
 			response = "";
 
 			cout <<"###|backwards read...\n" ;
+			//!!!
+			//sometimes here happens socket exception
+			//kleinei to socket gia kapoio logo
+			//an looparei polu h den proxwraei esp_restart ;)
 			command = servableClient.recvData();
 		
 			cout <<"###|apache command :" <<command <<endl;
@@ -983,10 +990,14 @@ void *servering(void *args)//this function is run by the server thread
 				//     APACHE_LED_STATE = !APACHE_LED_STATE;
 				//     gpio_set_level(GPIO_APACHE_LED, APACHE_LED_STATE);
 				//}
+			}else
+			{
+				cout <<"Got ya naked" <<endl;
 			}
 		}catch (SocketException &e)
 		{
 			cout <<e.what() << e.getMsg() <<endl;
+			cout <<"Got ya" <<endl;
 		}
 
 			//vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -1169,6 +1180,7 @@ void app_main()
 			pthread_mutex_lock(&lockSocket);
 			try
 			{
+				printf("###|Just before sending Bluetooth data.\n");
 				client.createSocket(EZPANDA_IP, "5678");
 				client.sendData(deviceReport);
 				client.closeClientSocket();
